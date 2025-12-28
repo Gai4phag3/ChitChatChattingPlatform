@@ -36,8 +36,16 @@ A real-time chat application that allows users to connect and message instantly 
 
 ## Screenshots
 
-![Chat Screen](https://via.placeholder.com/600x400.png?text=Chat+Screen)  
-*Replace with your actual screenshots*
+### Home Screen
+<img width="3230" height="1177" alt="image" src="https://github.com/user-attachments/assets/ce5c4e07-d9b3-4c63-b41a-b1d8c3b214c6" />
+
+### User Dashboard
+<img width="1366" height="1041" alt="image" src="https://github.com/user-attachments/assets/4640634f-65f7-4163-96cf-fb16ad92c837" />
+
+### Chatting environment
+<img width="3417" height="1217" alt="image" src="https://github.com/user-attachments/assets/e7156947-af5d-44b5-8d30-876b19b3f0ad" />
+
+
 
 ---
 
