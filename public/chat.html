@@ -6,39 +6,34 @@
   <link rel="icon" href="/favicon.png" type="image/x-icon" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="stylesheet" href="chat.css" />
-  <style>
-    /* Image message styling */
-    .message img {
-      max-width: 200px;
-      max-height: 150px;
-      border-radius: 12px;
-      display: block;
-      margin-top: 6px;
-    }
-    /* Image upload button */
-    #image-upload-btn {
-      background: none;
-      border: none;
-      font-size: 20px;
-      margin-left: 8px;
-      cursor: pointer;
-      flex-shrink: 0;
-    }
-  </style>
 </head>
 <body>
   <div class="container">
     <div class="top-bar">
-      <button onclick="goToDashboard()" class="back-button">⬅</button>
+      <button onclick="goToDashboard()" class="back-button" title="Back">⬅</button>
+      <div class="chat-header-info">
+        <span id="chat-with"></span>
+      </div>
+      <div class="call-actions">
+        <button type="button" id="audio-call-btn" title="Voice call">📞</button>
+        <button type="button" id="video-call-btn" title="Video call">🎥</button>
+      </div>
     </div>
 
-    <h2>
-      <span id="user-display"></span><br>
-      <small style="font-size: 14px; color: #555;">(@<span id="username-display"></span>)</small><br>
-      chatting with <span id="chat-with"></span>
-    </h2>
+    <div class="you-are">
+      <span id="user-display"></span> (@<span id="username-display"></span>)
+    </div>
 
     <ul id="messages"></ul>
+
+    <!-- Reply preview shown above the composer -->
+    <div id="reply-preview" class="reply-preview hidden">
+      <div class="reply-preview-body">
+        <span class="reply-preview-label" id="reply-preview-label"></span>
+        <span class="reply-preview-text" id="reply-preview-text"></span>
+      </div>
+      <button type="button" id="cancel-reply" title="Cancel reply">✕</button>
+    </div>
 
     <form id="form">
       <input id="input" autocomplete="off" placeholder="Type a message..." />
@@ -49,6 +44,34 @@
       <div id="emoji-picker" aria-label="Emoji picker" role="list"></div>
       <input type="file" id="image-input" accept="image/*" style="display:none" />
     </form>
+  </div>
+
+  <!-- Reaction picker (floating) -->
+  <div id="reaction-picker" class="reaction-picker hidden"></div>
+
+  <!-- Incoming call banner -->
+  <div id="incoming-call" class="incoming-call hidden">
+    <span id="incoming-text">Incoming call…</span>
+    <div class="incoming-buttons">
+      <button type="button" id="accept-call" class="accept">Accept</button>
+      <button type="button" id="decline-call" class="decline">Decline</button>
+    </div>
+  </div>
+
+  <!-- Call modal -->
+  <div id="call-modal" class="call-modal hidden">
+    <div class="call-inner">
+      <div class="call-status" id="call-status">Calling…</div>
+      <div class="videos">
+        <video id="remote-video" autoplay playsinline></video>
+        <video id="local-video" autoplay playsinline muted></video>
+      </div>
+      <div class="call-controls">
+        <button type="button" id="toggle-mute" title="Mute">🎤</button>
+        <button type="button" id="toggle-cam" title="Camera">📷</button>
+        <button type="button" id="hangup-btn" class="hangup" title="Hang up">📴</button>
+      </div>
+    </div>
   </div>
 
   <!-- Firebase -->
@@ -78,61 +101,316 @@
     document.getElementById("chat-with").textContent = chatWith;
 
     const chatId = [username, chatWith].sort().join('_');
+    const messagesRef = db.collection("chats").doc(chatId).collection("messages");
+    const FieldValue = firebase.firestore.FieldValue;
 
-    // --- REAL-TIME LISTENER ---
-    db.collection("chats")
-      .doc(chatId)
-      .collection("messages")
-      .orderBy("timestamp", "asc")
-      .onSnapshot(snapshot => {
-        messages.innerHTML = ""; // Clear and re-render
-        snapshot.forEach(doc => {
-          const data = doc.data();
-          addMessageToUI(data.sender, data.text, data.timestamp);
+    // Cache of message data by id, used by reply/react handlers.
+    const messagesById = {};
+    let initialLoaded = false;
+
+    /* =====================================================================
+       NOTIFICATIONS
+    ===================================================================== */
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+
+    let audioCtx = null;
+    function playBeep() {
+      try {
+        audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.type = "sine";
+        osc.frequency.value = 660;
+        gain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.2, audioCtx.currentTime + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.3);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.32);
+      } catch (e) { /* ignore audio errors */ }
+    }
+
+    function notifyNewMessage(data) {
+      playBeep();
+      const body = data.text && data.text.startsWith("data:image/")
+        ? "📷 Sent a photo"
+        : (data.text || "");
+      if ("Notification" in window && Notification.permission === "granted" && document.hidden) {
+        const n = new Notification(`${data.sender} on ChitChat`, {
+          body,
+          icon: "/favicon.png",
+          tag: chatId
         });
-        messages.scrollTop = messages.scrollHeight;
+        n.onclick = () => { window.focus(); n.close(); };
+      }
+    }
+
+    /* =====================================================================
+       REPLY STATE
+    ===================================================================== */
+    let replyTarget = null; // { id, sender, text }
+    const replyPreview = document.getElementById("reply-preview");
+    const replyPreviewLabel = document.getElementById("reply-preview-label");
+    const replyPreviewText = document.getElementById("reply-preview-text");
+
+    function previewText(text) {
+      if (!text) return "";
+      if (text.startsWith("data:image/")) return "📷 Photo";
+      return text.length > 60 ? text.slice(0, 60) + "…" : text;
+    }
+
+    function setReplyTarget(id) {
+      const data = messagesById[id];
+      if (!data) return;
+      replyTarget = { id, sender: data.sender, text: data.text || "" };
+      replyPreviewLabel.textContent = "Replying to " + data.sender;
+      replyPreviewText.textContent = previewText(data.text);
+      replyPreview.classList.remove("hidden");
+      input.focus();
+    }
+
+    function clearReplyTarget() {
+      replyTarget = null;
+      replyPreview.classList.add("hidden");
+    }
+
+    document.getElementById("cancel-reply").addEventListener("click", clearReplyTarget);
+
+    /* =====================================================================
+       REACTIONS
+    ===================================================================== */
+    const REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
+    const reactionPicker = document.getElementById("reaction-picker");
+    let reactionTargetId = null;
+
+    REACTION_EMOJIS.forEach(emoji => {
+      const span = document.createElement("span");
+      span.textContent = emoji;
+      span.addEventListener("click", () => {
+        if (reactionTargetId) toggleReaction(reactionTargetId, emoji);
+        hideReactionPicker();
+      });
+      reactionPicker.appendChild(span);
+    });
+
+    let suppressNextPickerClose = false;
+    function showReactionPicker(id, anchorEl) {
+      reactionTargetId = id;
+      suppressNextPickerClose = true;
+      setTimeout(() => { suppressNextPickerClose = false; }, 0);
+      reactionPicker.classList.remove("hidden");
+      const rect = anchorEl.getBoundingClientRect();
+      const pickerWidth = 220;
+      let left = rect.left + rect.width / 2 - pickerWidth / 2;
+      left = Math.max(8, Math.min(left, window.innerWidth - pickerWidth - 8));
+      let top = rect.top - 52;
+      if (top < 8) top = rect.bottom + 8;
+      reactionPicker.style.left = left + "px";
+      reactionPicker.style.top = top + "px";
+    }
+
+    function hideReactionPicker() {
+      reactionTargetId = null;
+      reactionPicker.classList.add("hidden");
+    }
+
+    document.addEventListener("click", (e) => {
+      if (suppressNextPickerClose) return;
+      if (!reactionPicker.contains(e.target) && !e.target.classList.contains("react-btn")) {
+        hideReactionPicker();
+      }
+    });
+
+    function toggleReaction(id, emoji) {
+      const data = messagesById[id];
+      if (!data) return;
+      const current = (data.reactions && data.reactions[emoji]) || [];
+      const field = "reactions." + emoji;
+      if (current.includes(username)) {
+        messagesRef.doc(id).update({ [field]: FieldValue.arrayRemove(username) });
+      } else {
+        messagesRef.doc(id).update({ [field]: FieldValue.arrayUnion(username) });
+      }
+    }
+
+    /* =====================================================================
+       REAL-TIME MESSAGE LISTENER + RENDER
+    ===================================================================== */
+    messagesRef.orderBy("timestamp", "asc").onSnapshot(snapshot => {
+      snapshot.docChanges().forEach(change => {
+        if (change.type === "added" && initialLoaded) {
+          const d = change.doc.data();
+          if (d.sender !== username) notifyNewMessage(d);
+        }
       });
 
-    function addMessageToUI(sender, text, timestamp) {
-      const time = new Date(timestamp).toLocaleTimeString([], {
+      messages.innerHTML = "";
+      snapshot.forEach(doc => {
+        messagesById[doc.id] = doc.data();
+        addMessageToUI(doc.id, doc.data());
+      });
+      messages.scrollTop = messages.scrollHeight;
+      initialLoaded = true;
+    });
+
+    function addMessageToUI(id, data) {
+      const sender = data.sender;
+      const text = data.text || "";
+      const time = new Date(data.timestamp).toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit"
       });
 
       const wrapper = document.createElement("li");
       wrapper.className = `message-wrapper ${sender === username ? "self" : "other"}`;
+      wrapper.dataset.id = id;
 
       const avatar = document.createElement("div");
       avatar.className = "avatar";
       avatar.textContent = sender.charAt(0).toUpperCase();
 
+      const col = document.createElement("div");
+      col.className = "msg-col";
+
+      // Hover actions (reply / react)
+      const actions = document.createElement("div");
+      actions.className = "msg-actions";
+      const replyBtn = document.createElement("button");
+      replyBtn.className = "reply-btn";
+      replyBtn.title = "Reply";
+      replyBtn.textContent = "↩";
+      replyBtn.addEventListener("click", () => setReplyTarget(id));
+      const reactBtn = document.createElement("button");
+      reactBtn.className = "react-btn";
+      reactBtn.title = "React";
+      reactBtn.textContent = "😊";
+      reactBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        showReactionPicker(id, reactBtn);
+      });
+      actions.appendChild(replyBtn);
+      actions.appendChild(reactBtn);
+
       const bubble = document.createElement("div");
       bubble.className = "message";
+
+      // Replied-to quote
+      if (data.replyTo) {
+        const quote = document.createElement("div");
+        quote.className = "reply-quote";
+        const qLabel = document.createElement("div");
+        qLabel.className = "reply-quote-label";
+        qLabel.textContent = data.replyTo.sender;
+        const qText = document.createElement("div");
+        qText.className = "reply-quote-text";
+        qText.textContent = previewText(data.replyTo.text);
+        quote.appendChild(qLabel);
+        quote.appendChild(qText);
+        bubble.appendChild(quote);
+      }
 
       if (text.startsWith("data:image/")) {
         const img = document.createElement("img");
         img.src = text;
         bubble.appendChild(img);
-        const timeDiv = document.createElement("div");
-        timeDiv.className = "time";
-        timeDiv.textContent = time;
-        bubble.appendChild(timeDiv);
       } else {
-        bubble.innerHTML = `${text}<div class="time">${time}</div>`;
+        const span = document.createElement("div");
+        span.className = "msg-text";
+        span.textContent = text;
+        bubble.appendChild(span);
       }
 
+      const timeDiv = document.createElement("div");
+      timeDiv.className = "time";
+      timeDiv.textContent = time;
+      bubble.appendChild(timeDiv);
+
+      // Reactions chips
+      const reactionsWrap = document.createElement("div");
+      reactionsWrap.className = "reactions";
+      if (data.reactions) {
+        Object.keys(data.reactions).forEach(emoji => {
+          const users = data.reactions[emoji] || [];
+          if (users.length === 0) return;
+          const chip = document.createElement("button");
+          chip.className = "reaction-chip" + (users.includes(username) ? " mine" : "");
+          chip.textContent = `${emoji} ${users.length}`;
+          chip.title = users.join(", ");
+          chip.addEventListener("click", () => toggleReaction(id, emoji));
+          reactionsWrap.appendChild(chip);
+        });
+      }
+
+      // Swipe-to-reply (touch) + long-press to react
+      enableGestures(bubble, id);
+
+      col.appendChild(actions);
+      col.appendChild(bubble);
+      col.appendChild(reactionsWrap);
+
       if (sender === username) {
-        wrapper.appendChild(bubble);
+        wrapper.appendChild(col);
         wrapper.appendChild(avatar);
       } else {
         wrapper.appendChild(avatar);
-        wrapper.appendChild(bubble);
+        wrapper.appendChild(col);
       }
 
       messages.appendChild(wrapper);
     }
 
-    // --- SEND TEXT MESSAGE ---
+    /* ---- Gestures: swipe to reply, long-press to react ---- */
+    function enableGestures(bubble, id) {
+      let startX = 0, startY = 0, dragging = false, longPressTimer = null, moved = false;
+
+      bubble.addEventListener("touchstart", (e) => {
+        startX = e.touches[0].clientX;
+        startY = e.touches[0].clientY;
+        dragging = true;
+        moved = false;
+        longPressTimer = setTimeout(() => {
+          if (!moved) showReactionPicker(id, bubble);
+        }, 500);
+      }, { passive: true });
+
+      bubble.addEventListener("touchmove", (e) => {
+        if (!dragging) return;
+        const dx = e.touches[0].clientX - startX;
+        const dy = e.touches[0].clientY - startY;
+        if (Math.abs(dx) > 8 || Math.abs(dy) > 8) {
+          moved = true;
+          clearTimeout(longPressTimer);
+        }
+        if (dx > 0 && Math.abs(dx) > Math.abs(dy)) {
+          const shift = Math.min(dx, 80);
+          bubble.style.transform = `translateX(${shift}px)`;
+          bubble.style.transition = "none";
+          if (shift >= 60) bubble.classList.add("swipe-armed");
+          else bubble.classList.remove("swipe-armed");
+        }
+      }, { passive: true });
+
+      function endTouch() {
+        clearTimeout(longPressTimer);
+        if (!dragging) return;
+        dragging = false;
+        const armed = bubble.classList.contains("swipe-armed");
+        bubble.style.transition = "transform 0.2s ease";
+        bubble.style.transform = "translateX(0)";
+        bubble.classList.remove("swipe-armed");
+        if (armed) setReplyTarget(id);
+      }
+
+      bubble.addEventListener("touchend", endTouch);
+      bubble.addEventListener("touchcancel", endTouch);
+    }
+
+    /* =====================================================================
+       SEND MESSAGE
+    ===================================================================== */
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const text = input.value.trim();
@@ -143,22 +421,46 @@
         text: text,
         timestamp: Date.now(),
       };
+      if (replyTarget) {
+        messageData.replyTo = {
+          id: replyTarget.id,
+          sender: replyTarget.sender,
+          text: replyTarget.text
+        };
+      }
 
-      await db.collection("chats")
-        .doc(chatId)
-        .collection("messages")
-        .add(messageData);
+      await messagesRef.add(messageData);
 
       input.value = "";
       emojiPicker.style.display = "none";
+      clearReplyTarget();
     });
+
+    async function sendImageMessage(imageDataUrl) {
+      const messageData = {
+        sender: username,
+        text: imageDataUrl,
+        timestamp: Date.now(),
+      };
+      if (replyTarget) {
+        messageData.replyTo = {
+          id: replyTarget.id,
+          sender: replyTarget.sender,
+          text: replyTarget.text
+        };
+      }
+      await messagesRef.add(messageData);
+      clearReplyTarget();
+    }
 
     function goToDashboard() {
       localStorage.removeItem("chatWith");
       window.location.href = "dashboard.html";
     }
 
-    // --- EMOJI PICKER ---
+    /* =====================================================================
+       EMOJI PICKER
+    ===================================================================== */
     const emojis = [
       "😀","😁","😂","🤣","😃","😄","😅","😆","😉","😊","😋","😎",
       "😍","😘","🥰","😗","😙","😚","🙂","🤗","🤩","🤔","😐","😑",
@@ -198,7 +500,9 @@
       inputElem.focus();
     }
 
-    // --- IMAGE UPLOAD ---
+    /* =====================================================================
+       IMAGE UPLOAD
+    ===================================================================== */
     imageUploadBtn.addEventListener("click", () => {
       imageInput.click();
     });
@@ -210,7 +514,6 @@
         alert("Please select a valid image file.");
         return;
       }
-
       const reader = new FileReader();
       reader.onload = function(e) {
         sendImageMessage(e.target.result);
@@ -235,18 +538,260 @@
       }
     });
 
-    async function sendImageMessage(imageDataUrl) {
-      const messageData = {
-        sender: username,
-        text: imageDataUrl,
-        timestamp: Date.now(),
-      };
+    /* =====================================================================
+       CALLS (WebRTC + Firestore signaling)
+    ===================================================================== */
+    const rtcConfig = {
+      iceServers: [
+        { urls: ["stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"] }
+      ],
+      iceCandidatePoolSize: 10
+    };
 
-      await db.collection("chats")
-        .doc(chatId)
-        .collection("messages")
-        .add(messageData);
+    const callModal = document.getElementById("call-modal");
+    const callStatus = document.getElementById("call-status");
+    const localVideo = document.getElementById("local-video");
+    const remoteVideo = document.getElementById("remote-video");
+    const incomingBanner = document.getElementById("incoming-call");
+    const incomingText = document.getElementById("incoming-text");
+    const audioCallBtn = document.getElementById("audio-call-btn");
+    const videoCallBtn = document.getElementById("video-call-btn");
+    const hangupBtn = document.getElementById("hangup-btn");
+    const acceptBtn = document.getElementById("accept-call");
+    const declineBtn = document.getElementById("decline-call");
+    const toggleMuteBtn = document.getElementById("toggle-mute");
+    const toggleCamBtn = document.getElementById("toggle-cam");
+
+    const callDocRef = db.collection("calls").doc(chatId);
+
+    let pc = null;
+    let localStream = null;
+    let remoteStream = null;
+    let callUnsubs = [];
+    let inCall = false;
+    let pendingIncoming = null;
+
+    function setCallStatus(text) { callStatus.textContent = text; }
+
+    async function getMedia(withVideo) {
+      return navigator.mediaDevices.getUserMedia({ audio: true, video: withVideo });
     }
+
+    function attachPeerHandlers(candidatesCollection) {
+      remoteStream = new MediaStream();
+      remoteVideo.srcObject = remoteStream;
+      pc.ontrack = (event) => {
+        event.streams[0].getTracks().forEach(t => remoteStream.addTrack(t));
+      };
+      pc.onicecandidate = (event) => {
+        if (event.candidate) candidatesCollection.add(event.candidate.toJSON());
+      };
+      pc.onconnectionstatechange = () => {
+        if (pc && (pc.connectionState === "disconnected" || pc.connectionState === "failed")) {
+          hangup();
+        }
+      };
+    }
+
+    // ---- Start an outgoing call ----
+    async function startCall(withVideo) {
+      if (inCall) return;
+      try {
+        localStream = await getMedia(withVideo);
+      } catch (err) {
+        alert("Could not access " + (withVideo ? "camera/microphone" : "microphone") + ". Check permissions.");
+        return;
+      }
+      inCall = true;
+      openCallModal(withVideo);
+      setCallStatus("Calling " + chatWith + "…");
+
+      pc = new RTCPeerConnection(rtcConfig);
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+      localVideo.srcObject = localStream;
+
+      const callerCandidates = callDocRef.collection("callerCandidates");
+      attachPeerHandlers(callerCandidates);
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      // Clear any stale candidates then write the offer.
+      await clearCandidates();
+      await callDocRef.set({
+        type: withVideo ? "video" : "audio",
+        caller: username,
+        callee: chatWith,
+        offer: { type: offer.type, sdp: offer.sdp },
+        status: "ringing",
+        createdAt: Date.now()
+      });
+
+      // Listen for answer / status changes.
+      callUnsubs.push(callDocRef.onSnapshot(async (snap) => {
+        const data = snap.data();
+        if (!data) { hangup(); return; }
+        if (data.status === "declined") { setCallStatus("Call declined"); setTimeout(hangup, 1200); return; }
+        if (data.answer && pc && !pc.currentRemoteDescription) {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+          setCallStatus("Connected");
+        }
+      }));
+
+      // Listen for callee ICE candidates.
+      callUnsubs.push(callDocRef.collection("calleeCandidates").onSnapshot(snap => {
+        snap.docChanges().forEach(c => {
+          if (c.type === "added" && pc) pc.addIceCandidate(new RTCIceCandidate(c.doc.data()));
+        });
+      }));
+    }
+
+    // ---- Accept an incoming call ----
+    async function acceptCall() {
+      if (!pendingIncoming || inCall) return;
+      const data = pendingIncoming;
+      const withVideo = data.type === "video";
+      hideIncoming();
+
+      try {
+        localStream = await getMedia(withVideo);
+      } catch (err) {
+        alert("Could not access camera/microphone.");
+        callDocRef.update({ status: "declined" }).catch(() => {});
+        return;
+      }
+      inCall = true;
+      openCallModal(withVideo);
+      setCallStatus("Connecting…");
+
+      pc = new RTCPeerConnection(rtcConfig);
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+      localVideo.srcObject = localStream;
+
+      const calleeCandidates = callDocRef.collection("calleeCandidates");
+      attachPeerHandlers(calleeCandidates);
+
+      await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      await callDocRef.update({
+        answer: { type: answer.type, sdp: answer.sdp },
+        status: "connected"
+      });
+      setCallStatus("Connected");
+
+      // Listen for caller ICE candidates.
+      callUnsubs.push(callDocRef.collection("callerCandidates").onSnapshot(snap => {
+        snap.docChanges().forEach(c => {
+          if (c.type === "added" && pc) pc.addIceCandidate(new RTCIceCandidate(c.doc.data()));
+        });
+      }));
+
+      // End when the call doc goes away.
+      callUnsubs.push(callDocRef.onSnapshot(snap => {
+        if (!snap.data()) hangup();
+      }));
+    }
+
+    function declineCall() {
+      callDocRef.update({ status: "declined" }).catch(() => {});
+      hideIncoming();
+    }
+
+    // ---- Hang up / cleanup ----
+    async function hangup() {
+      const wasInCall = inCall || callUnsubs.length > 0;
+      inCall = false;
+      callUnsubs.forEach(u => { try { u(); } catch (e) {} });
+      callUnsubs = [];
+      if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+      if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+      remoteStream = null;
+      localVideo.srcObject = null;
+      remoteVideo.srcObject = null;
+      closeCallModal();
+      // The side that hangs up removes the signaling doc so the peer ends too.
+      if (wasInCall) {
+        await clearCandidates();
+        await callDocRef.delete().catch(() => {});
+      }
+    }
+
+    async function clearCandidates() {
+      for (const name of ["callerCandidates", "calleeCandidates"]) {
+        const snap = await callDocRef.collection(name).get().catch(() => null);
+        if (snap) {
+          const batch = db.batch();
+          snap.forEach(d => batch.delete(d.ref));
+          await batch.commit().catch(() => {});
+        }
+      }
+    }
+
+    function openCallModal(withVideo) {
+      callModal.classList.remove("hidden");
+      callModal.classList.toggle("audio-only", !withVideo);
+      toggleCamBtn.style.display = withVideo ? "" : "none";
+    }
+    function closeCallModal() {
+      callModal.classList.add("hidden");
+    }
+
+    function showIncoming(data) {
+      pendingIncoming = data;
+      incomingText.textContent = `${data.caller} is ${data.type === "video" ? "video " : ""}calling…`;
+      incomingBanner.classList.remove("hidden");
+      playBeep();
+    }
+    function hideIncoming() {
+      pendingIncoming = null;
+      incomingBanner.classList.add("hidden");
+    }
+
+    // ---- Global listener for the shared call doc ----
+    callDocRef.onSnapshot(snap => {
+      const data = snap.data();
+      if (!data) { hideIncoming(); return; }
+      // Someone is calling me and I'm not already in a call.
+      if (data.status === "ringing" && data.callee === username && data.caller === chatWith && !inCall) {
+        showIncoming(data);
+      } else if (data.status !== "ringing") {
+        hideIncoming();
+      }
+    });
+
+    // Controls
+    audioCallBtn.addEventListener("click", () => startCall(false));
+    videoCallBtn.addEventListener("click", () => startCall(true));
+    hangupBtn.addEventListener("click", hangup);
+    acceptBtn.addEventListener("click", acceptCall);
+    declineBtn.addEventListener("click", declineCall);
+
+    toggleMuteBtn.addEventListener("click", () => {
+      if (!localStream) return;
+      const track = localStream.getAudioTracks()[0];
+      if (!track) return;
+      track.enabled = !track.enabled;
+      toggleMuteBtn.textContent = track.enabled ? "🎤" : "🔇";
+      toggleMuteBtn.classList.toggle("off", !track.enabled);
+    });
+
+    toggleCamBtn.addEventListener("click", () => {
+      if (!localStream) return;
+      const track = localStream.getVideoTracks()[0];
+      if (!track) return;
+      track.enabled = !track.enabled;
+      toggleCamBtn.textContent = track.enabled ? "📷" : "🚫";
+      toggleCamBtn.classList.toggle("off", !track.enabled);
+    });
+
+    // Best-effort cleanup if user leaves mid-call.
+    window.addEventListener("beforeunload", () => {
+      if (inCall) {
+        callDocRef.delete().catch(() => {});
+      }
+    });
   </script>
 </body>
 </html>
