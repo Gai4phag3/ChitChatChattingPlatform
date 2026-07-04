@@ -14,7 +14,10 @@
   />
   
   <link rel="stylesheet" href="dash.css" />
-  
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#007aff" />
+  <link rel="apple-touch-icon" href="/favicon.png" />
+
   <style>
     .friend-button {
       margin: 8px 0;
@@ -113,6 +116,40 @@
     }
 
     document.getElementById("username-display").textContent = currentUser;
+
+    // ---- Notifications / PWA ----
+    let swRegistration = null;
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js")
+        .then(reg => { swRegistration = reg; })
+        .catch(() => {});
+    }
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+    const lastNotifiedTs = {};
+    const watchedFriends = new Set();
+
+    function showSystemNotification(title, body, tag) {
+      if (!("Notification" in window) || Notification.permission !== "granted") return;
+      const options = {
+        body,
+        icon: "/favicon.png",
+        badge: "/favicon.png",
+        tag: tag || "chitchat-msg",
+        renotify: true,
+        vibrate: [180, 80, 180],
+        data: { url: "/dashboard.html" }
+      };
+      if (swRegistration && swRegistration.showNotification) {
+        swRegistration.showNotification(title, options);
+      } else {
+        try {
+          const n = new Notification(title, options);
+          n.onclick = () => { window.focus(); n.close(); };
+        } catch (e) { /* mobile requires the service worker path */ }
+      }
+    }
 
     const friendList = document.getElementById("friend-list");
     const friendRequestsDiv = document.getElementById("friend-requests");
@@ -269,6 +306,12 @@
     }
 
     function watchUnreadMessages(friendUsername) {
+      // Avoid attaching duplicate listeners when the friend list re-renders.
+      if (watchedFriends.has(friendUsername)) return;
+      watchedFriends.add(friendUsername);
+      // Baseline: only messages arriving after this point trigger a notification.
+      lastNotifiedTs[friendUsername] = Date.now();
+
       const chatId = [currentUser, friendUsername].sort().join('_');
 
       db.collection("lastRead")
@@ -285,13 +328,22 @@
               snapshot.forEach(doc => {
                 const data = doc.data();
                 const notifEl = document.getElementById(`notif-${friendUsername}`);
-                if (!notifEl) return;
 
-                if (data.sender !== currentUser && data.timestamp > lastRead) {
-                  notifEl.style.display = "inline-block";
+                const isUnread = data.sender !== currentUser && data.timestamp > lastRead;
+
+                if (notifEl) {
+                  notifEl.style.display = isUnread ? "inline-block" : "none";
                   notifEl.textContent = "1";
-                } else {
-                  notifEl.style.display = "none";
+                }
+
+                // Push a system notification for genuinely new incoming messages
+                // (works while the app is backgrounded, e.g. on your phone).
+                if (isUnread && data.timestamp > (lastNotifiedTs[friendUsername] || 0) && document.hidden) {
+                  lastNotifiedTs[friendUsername] = data.timestamp;
+                  const body = data.text && data.text.startsWith("data:image/")
+                    ? "📷 Sent a photo"
+                    : (data.text || "");
+                  showSystemNotification(`${friendUsername} on ChitChat`, body, "chitchat-" + friendUsername);
                 }
               });
             });

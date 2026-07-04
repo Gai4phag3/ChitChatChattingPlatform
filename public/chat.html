@@ -6,6 +6,9 @@
   <link rel="icon" href="/favicon.png" type="image/x-icon" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="stylesheet" href="chat.css" />
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#007aff" />
+  <link rel="apple-touch-icon" href="/favicon.png" />
 </head>
 <body>
   <div class="container">
@@ -115,6 +118,15 @@
       Notification.requestPermission();
     }
 
+    // Service worker powers notifications on mobile (Android Chrome cannot use
+    // the `new Notification()` constructor — it must go through the SW).
+    let swRegistration = null;
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js")
+        .then(reg => { swRegistration = reg; })
+        .catch(() => {});
+    }
+
     let audioCtx = null;
     function playBeep() {
       try {
@@ -135,16 +147,33 @@
 
     function notifyNewMessage(data) {
       playBeep();
+      if (!document.hidden) return; // don't notify while actively viewing
       const body = data.text && data.text.startsWith("data:image/")
         ? "📷 Sent a photo"
         : (data.text || "");
-      if ("Notification" in window && Notification.permission === "granted" && document.hidden) {
-        const n = new Notification(`${data.sender} on ChitChat`, {
-          body,
-          icon: "/favicon.png",
-          tag: chatId
-        });
-        n.onclick = () => { window.focus(); n.close(); };
+      showSystemNotification(`${data.sender} on ChitChat`, body);
+    }
+
+    function showSystemNotification(title, body) {
+      if (!("Notification" in window) || Notification.permission !== "granted") return;
+      const options = {
+        body,
+        icon: "/favicon.png",
+        badge: "/favicon.png",
+        tag: chatId,
+        renotify: true,
+        vibrate: [180, 80, 180],
+        data: { url: "/chat.html" }
+      };
+      // Prefer the service worker (required on mobile); fall back to the
+      // Notification constructor on desktop browsers without an active SW.
+      if (swRegistration && swRegistration.showNotification) {
+        swRegistration.showNotification(title, options);
+      } else {
+        try {
+          const n = new Notification(title, options);
+          n.onclick = () => { window.focus(); n.close(); };
+        } catch (e) { /* mobile requires the SW path above */ }
       }
     }
 
@@ -543,7 +572,13 @@
     ===================================================================== */
     const rtcConfig = {
       iceServers: [
-        { urls: ["stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"] }
+        { urls: ["stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"] },
+        // Free public TURN relay (Open Relay by Metered) so calls connect even
+        // behind strict/symmetric NATs. Best-effort — swap for your own TURN
+        // credentials (Metered/Twilio/coturn) for production reliability.
+        { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+        { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+        { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" }
       ],
       iceCandidatePoolSize: 10
     };
@@ -570,6 +605,7 @@
     let callUnsubs = [];
     let inCall = false;
     let pendingIncoming = null;
+    let ringTimeout = null;
 
     function setCallStatus(text) { callStatus.textContent = text; }
 
@@ -627,12 +663,21 @@
         createdAt: Date.now()
       });
 
+      // Auto-cancel if the callee never answers.
+      ringTimeout = setTimeout(() => {
+        if (pc && !pc.currentRemoteDescription) {
+          setCallStatus("No answer");
+          setTimeout(hangup, 1200);
+        }
+      }, 45000);
+
       // Listen for answer / status changes.
       callUnsubs.push(callDocRef.onSnapshot(async (snap) => {
         const data = snap.data();
         if (!data) { hangup(); return; }
         if (data.status === "declined") { setCallStatus("Call declined"); setTimeout(hangup, 1200); return; }
         if (data.answer && pc && !pc.currentRemoteDescription) {
+          if (ringTimeout) { clearTimeout(ringTimeout); ringTimeout = null; }
           await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
           setCallStatus("Connected");
         }
@@ -703,6 +748,7 @@
     async function hangup() {
       const wasInCall = inCall || callUnsubs.length > 0;
       inCall = false;
+      if (ringTimeout) { clearTimeout(ringTimeout); ringTimeout = null; }
       callUnsubs.forEach(u => { try { u(); } catch (e) {} });
       callUnsubs = [];
       if (pc) { try { pc.close(); } catch (e) {} pc = null; }
@@ -750,13 +796,34 @@
     }
 
     // ---- Global listener for the shared call doc ----
+    // A single doc per chat is reused for signaling; guard hard against stale
+    // "ringing" docs (abandoned calls) that would otherwise show phantom
+    // incoming-call banners every time the chat is opened.
+    let shownIncomingKey = null;
+    const CALL_FRESH_MS = 60000;
     callDocRef.onSnapshot(snap => {
       const data = snap.data();
-      if (!data) { hideIncoming(); return; }
-      // Someone is calling me and I'm not already in a call.
-      if (data.status === "ringing" && data.callee === username && data.caller === chatWith && !inCall) {
-        showIncoming(data);
-      } else if (data.status !== "ringing") {
+      if (!data) { shownIncomingKey = null; hideIncoming(); return; }
+
+      const isRinging = data.status === "ringing";
+      const forMe = data.callee === username && data.caller === chatWith;
+      const fresh = data.createdAt && (Date.now() - data.createdAt) < CALL_FRESH_MS;
+
+      // Stale ringing doc from an abandoned call — clean it up, don't ring.
+      if (isRinging && !fresh) {
+        callDocRef.delete().catch(() => {});
+        hideIncoming();
+        return;
+      }
+
+      if (isRinging && forMe && fresh && !inCall) {
+        const key = String(data.createdAt);
+        if (shownIncomingKey !== key) {   // only ring once per real call
+          shownIncomingKey = key;
+          showIncoming(data);
+        }
+      } else if (!isRinging) {
+        shownIncomingKey = null;
         hideIncoming();
       }
     });
