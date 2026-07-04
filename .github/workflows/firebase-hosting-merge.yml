@@ -18,3 +18,14 @@ jobs:
           firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_CHITCHAT_254BC }}
           channelId: live
           projectId: chitchat-254bc
+      # Deploy the push Cloud Function. Non-blocking: this only succeeds once the
+      # Firebase project is on the Blaze plan and the service account has the
+      # Cloud Functions Developer + Service Account User roles. Until then the
+      # hosting deploy above still ships and the build stays green.
+      - name: Deploy Cloud Functions
+        continue-on-error: true
+        uses: w9jds/firebase-action@master
+        with:
+          args: deploy --only functions --project chitchat-254bc --force
+        env:
+          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_CHITCHAT_254BC }}

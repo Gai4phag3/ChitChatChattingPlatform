@@ -80,7 +80,9 @@
   <!-- Firebase -->
   <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
   <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-firestore.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-messaging.js"></script>
   <script src="firebase-config.js"></script>
+  <script src="push.js"></script>
 
   <script>
     const form = document.getElementById("form");
@@ -106,6 +108,12 @@
     const chatId = [username, chatWith].sort().join('_');
     const messagesRef = db.collection("chats").doc(chatId).collection("messages");
     const FieldValue = firebase.firestore.FieldValue;
+
+    // Record participants so the push Cloud Function can find the recipient.
+    db.collection("chats").doc(chatId).set(
+      { participants: [username, chatWith] },
+      { merge: true }
+    ).catch(() => {});
 
     // Cache of message data by id, used by reply/react handlers.
     const messagesById = {};
